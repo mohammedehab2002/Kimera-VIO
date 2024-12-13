@@ -21,6 +21,18 @@ For evaluation plots, check our [jenkins server](http://ci-sparklab.mit.edu:8080
 
 Kimera-VIO is a Visual Inertial Odometry pipeline for accurate State Estimation from **Stereo** + **IMU** data. It can optionally use **Mono** + **IMU** data instead of stereo cameras.
 
+## How to Run this Version?
+
+In addition to all the steps for running Kimera, you need to
+
+1-Download and install the [C++ LibTorch](https://pytorch.org/get-started/locally/) and [FAISS](https://github.com/facebookresearch/faiss/blob/main/INSTALL.md) from source. Make sure to install the CPU cxx11-abi version of LibTorch.
+
+2-Clone [SALAD CM](https://github.com/serizba/cliquemining), move script-SALAD.py to the cliquemining repo, and run it. It will output a .pt scripted model.
+
+3-Run Kimera with the flag lcd_SALAD_path=/path/to/scripted-SALAD.pt.
+
+If you'd like to run the original BoW Kimera, set the flag lcd_use_BoW=true.
+
 ## Publications
 
 We kindly ask to cite our paper if you find this library useful:
