@@ -4,12 +4,15 @@ project(kimera_vio VERSION 1.0 LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # Make sure that custom modules like FindXXXX are found
 # Prefer to use system installation of gflags/glog
 set(GFLAGS_PREFER_EXPORTED_GFLAGS_CMAKE_CONFIGURATION TRUE)
 set(GLOG_PREFER_EXPORTED_GLOG_CMAKE_CONFIGURATION TRUE)
 list(INSERT CMAKE_MODULE_PATH 0 ${CMAKE_SOURCE_DIR}/cmake)
+
+add_definitions(-DC10_USE_GLOG)
 
 IF(APPLE)
     # Fix linking on 10.14+. See https://stackoverflow.com/questions/54068035
@@ -30,6 +33,17 @@ find_package(GTSAM_UNSTABLE REQUIRED)
 find_package(opengv REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(DBoW2 REQUIRED)
+find_package(Torch REQUIRED)
+find_package(faiss REQUIRED)
+find_package(OpenMP REQUIRED)
+
+if (OPENMP_FOUND)
+    target_link_libraries(OpenMP::OpenMP_CXX)
+endif()
+
+include_directories(${faiss_INCLUDE_DIRS})
+
+list(APPEND CMAKE_PREFIX_PATH "/home/xorcist/libtorch/")
 if(NOT TARGET DBoW2::DBoW2)
   add_library(DBoW2::DBoW2 INTERFACE IMPORTED)
   set_target_properties(DBoW2::DBoW2 PROPERTIES
@@ -134,6 +148,8 @@ target_link_libraries(${PROJECT_NAME}
     ${OpenCV_LIBRARIES}
     ${GFLAGS_LIBRARIES}
     ${GLOG_LIBRARIES}
+    "${TORCH_LIBRARIES}"
+    faiss
     gtsam
     gtsam_unstable
 )
@@ -146,6 +162,7 @@ target_include_directories(${PROJECT_NAME}
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
 
 # Pangolin is optional
 if(Pangolin_FOUND)
@@ -173,7 +190,8 @@ target_compile_features(${PROJECT_NAME} PUBLIC
 add_library(kimera_vio::kimera_vio ALIAS kimera_vio)
 
 add_executable(stereoVIOEuroc ./examples/KimeraVIO.cpp)
-target_link_libraries(stereoVIOEuroc PUBLIC kimera_vio::kimera_vio)
+target_link_libraries(stereoVIOEuroc PUBLIC kimera_vio::kimera_vio "${TORCH_LIBRARIES}")
+set_property(TARGET stereoVIOEuroc PROPERTY CXX_STANDARD 17)
 
 ############################### TESTS ##########################################
 ### Add testing

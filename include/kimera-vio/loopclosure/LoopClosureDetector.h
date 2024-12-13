@@ -11,6 +11,7 @@
  * @brief  Pipeline for detection and reporting of Loop Closures between frames
  * @author Marcus Abate
  * @author Luca Carlone
+ * @author Mohammed Ehab
  */
 
 #pragma once
@@ -35,6 +36,9 @@
 #include "kimera-vio/loopclosure/LcdOutputPacket.h"
 #include "kimera-vio/loopclosure/LoopClosureDetector-definitions.h"
 #include "kimera-vio/loopclosure/LoopClosureDetectorParams.h"
+
+#include <torch/script.h>
+#include <faiss/IndexFlat.h>
 
 /* ------------------------------------------------------------------------ */
 // Forward declare KimeraRPGO, a private dependency.
@@ -177,6 +181,7 @@ class LoopClosureDetector {
    */
   void detectLoop(const FrameId& frame_id,
                   const DBoW2::BowVector& bow_vec,
+                  const at::Tensor& SALAD_descriptors_mat,
                   LoopResult* result);
 
   /* ------------------------------------------------------------------------ */
@@ -431,6 +436,11 @@ class LoopClosureDetector {
   // Store latest computed objects for temporal matching and nss scoring
   std::unique_ptr<LcdThirdPartyWrapper> lcd_tp_wrapper_;
   std::unique_ptr<DBoW2::BowVector> latest_bowvec_;
+
+  // SALAD definitions
+  torch::jit::Module salad;
+  faiss::IndexFlatIP index;
+  std::unique_ptr<at::Tensor> latest_SALAD_vec_;
 
   // Store camera parameters and StereoFrame stuff once
   gtsam::Pose3 B_Pose_Cam_;

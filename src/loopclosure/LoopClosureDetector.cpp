@@ -12,6 +12,7 @@
  * @author Marcus Abate
  * @author Antoni Rosinol
  * @author Luca Carlone
+ * @author Mohammed Ehab
  */
 
 #include "kimera-vio/loopclosure/LoopClosureDetector.h"
@@ -34,6 +35,11 @@
 #include "kimera-vio/utils/Timer.h"
 #include "kimera-vio/utils/UtilsOpenCV.h"
 
+#include <torch/script.h>
+#include <faiss/IndexFlat.h>
+#include <algorithm>
+#include <vector>
+
 DEFINE_string(vocabulary_path,
               "../vocabulary/ORBvoc.yml",
               "Path to BoW vocabulary file for LoopClosureDetector module.");
@@ -50,6 +56,14 @@ DEFINE_bool(lcd_no_detection,
 DEFINE_bool(lcd_disable_stereo_match_depth_check,
             false,
             "disable thresholding of stereo landmark correspondences");
+
+DEFINE_bool(lcd_use_BoW,
+            false,
+            "use BoW instead of SALAD");
+
+DEFINE_string(lcd_SALAD_path,
+              "/home/xorcist/SALAD_scripted_238_308.pt",
+              "traced SALAD model path");
 
 /** Verbosity settings: (cumulative with every increase in level)
       0: Runtime errors and warnings, spin start and frequency are reported.
@@ -101,7 +115,8 @@ LoopClosureDetector::LoopClosureDetector(
       db_BoW_(nullptr),
       cache_(lcd_params.frame_cache),
       lcd_tp_wrapper_(nullptr),
-      latest_bowvec_(new DBoW2::BowVector()),
+      latest_bowvec_(nullptr),
+      latest_SALAD_vec_(nullptr),
       B_Pose_Cam_(B_Pose_Cam),
       stereo_camera_(stereo_camera ? stereo_camera.value() : nullptr),
       stereo_matcher_(nullptr),
@@ -154,19 +169,38 @@ LoopClosureDetector::LoopClosureDetector(
       cv::DescriptorMatcher::create(lcd_params_.matcher_type_);
 
   // Load ORB vocabulary:
-
   std::unique_ptr<OrbVocabulary> vocab;
-  if (preloaded_vocab && preloaded_vocab->vocab) {
-    vocab = std::move(preloaded_vocab->vocab);
-  } else {
-    vocab = loadOrbVocabulary();
+  if (FLAGS_lcd_use_BoW)
+  {
+    if (preloaded_vocab && preloaded_vocab->vocab) {
+      vocab = std::move(preloaded_vocab->vocab);
+    } else {
+      vocab = loadOrbVocabulary();
+    }
   }
 
   // Initialize the thirdparty wrapper:
   lcd_tp_wrapper_ = std::make_unique<LcdThirdPartyWrapper>(lcd_params_);
 
   // Initialize db_BoW_:
-  db_BoW_ = std::make_unique<OrbDatabase>(*vocab);
+  if (FLAGS_lcd_use_BoW)
+  {
+    // Initialize db_BoW_:
+    db_BoW_ = std::make_unique<OrbDatabase>(*vocab);
+  }
+  else
+  {
+    // Initialize FAISS
+    index = faiss::IndexFlatIP(8192+256); // SALAD Descriptor Dimension
+
+    // Initialize SALAD
+    try {
+        salad = torch::jit::load(FLAGS_lcd_SALAD_path);
+    } catch (const c10::Error& e) {
+        LOG(FATAL) << "Error loading SALAD\n";
+    }
+    LOG(INFO) << "SALAD loaded successfully\n";
+  }
 
   // Initialize pgo_:
   // TODO(marcus): parametrize the verbosity of PGO params
@@ -222,6 +256,8 @@ LcdOutput::UniquePtr LoopClosureDetector::spinOnce(const LcdInput& input) {
     }
   }
 
+  cv::Mat img;
+
   // Process the StereoFrame and check for a loop closure with previous ones.
   FrameId lcd_frame_id;
   switch (input.frontend_output_->frontend_type_) {
@@ -234,6 +270,7 @@ LcdOutput::UniquePtr LoopClosureDetector::spinOnce(const LcdInput& input) {
         lcd_frame_id = processAndAddMonoFrame(mono_frontend_output->frame_lkf_,
                                               input.W_points_with_ids_,
                                               input.W_Pose_Blkf_);
+        img=(mono_frontend_output->frame_lkf_).img_.clone();
       } else {
         LOG(FATAL) << "We have a mono frontend but no PnP pose recovery in LCD "
                       "module. Must be a mistake!";
@@ -247,6 +284,7 @@ LcdOutput::UniquePtr LoopClosureDetector::spinOnce(const LcdInput& input) {
       CHECK(stereo_frontend_output);
       lcd_frame_id =
           processAndAddStereoFrame(stereo_frontend_output->stereo_frame_lkf_);
+      img=(stereo_frontend_output->stereo_frame_lkf_).left_frame_.img_.clone();
       break;
     }
     case FrontendType::kRgbdImu: {
@@ -255,6 +293,7 @@ LcdOutput::UniquePtr LoopClosureDetector::spinOnce(const LcdInput& input) {
       CHECK(rgbd_frontend_output);
       lcd_frame_id =
           processAndAddRgbdFrame(rgbd_frontend_output->rgbd_frame_lkf_);
+      img=(rgbd_frontend_output->rgbd_frame_lkf_).intensity_img_.img_.clone(); // Untested
       break;
     }
     default: {
@@ -266,18 +305,43 @@ LcdOutput::UniquePtr LoopClosureDetector::spinOnce(const LcdInput& input) {
   const auto curr_frame = cache_.getFrame(lcd_frame_id);
   CHECK(curr_frame) << "Invalid frame requested!";
   DBoW2::BowVector curr_bow_vec;
-  db_BoW_->getVocabulary()->transform(curr_frame->descriptors_vec_,
+  at::Tensor SALAD_descriptors_mat;
+  if (FLAGS_lcd_use_BoW)
+  {
+    db_BoW_->getVocabulary()->transform(curr_frame->descriptors_vec_,
                                       curr_bow_vec);
+  }
+  else
+  {
+    cv::Mat rgb_img;
+    cv::resize(img,rgb_img,cv::Size(308,238));
+    cv::cvtColor(rgb_img,rgb_img,cv::COLOR_GRAY2BGR);
+    cv::imshow("SALAD's input",rgb_img);
+    cv::cvtColor(rgb_img,rgb_img,cv::COLOR_BGR2RGB);
+    rgb_img.convertTo(rgb_img,CV_32F);
+    auto tensor=torch::from_blob(
+        rgb_img.data,
+        {1,rgb_img.rows,rgb_img.cols,rgb_img.channels()},
+        torch::kFloat32
+    );
+    tensor=tensor.permute({0,3,1,2});
+    tensor/=255.0;
+    SALAD_descriptors_mat=salad.forward({tensor}).toTensor();
+    SALAD_descriptors_mat=SALAD_descriptors_mat.contiguous();
+  }
 
   LoopResult loop_result;
   loop_result.status_ = LCDStatus::NO_MATCHES;
   if (!FLAGS_lcd_no_detection) {
-    detectLoop(lcd_frame_id, curr_bow_vec, &loop_result);
+    detectLoop(lcd_frame_id, curr_bow_vec, SALAD_descriptors_mat, &loop_result);
   }
 
   // Update latest bowvec for normalized similarity scoring (NSS).
   if (static_cast<int>(lcd_frame_id + 1) > lcd_params_.recent_frames_window_) {
+    if (FLAGS_lcd_use_BoW)
     latest_bowvec_.reset(new DBoW2::BowVector(curr_bow_vec));
+    else
+    latest_SALAD_vec_.reset(new at::Tensor(SALAD_descriptors_mat));
   } else {
     VLOG(3) << "LoopClosureDetector: Not enough frames processed.";
   }
@@ -664,6 +728,9 @@ void LoopClosureDetector::descriptorMatToVec(
 /* ------------------------------------------------------------------------ */
 void LoopClosureDetector::detectLoopById(const FrameId& frame_id,
                                          LoopResult* result) {
+  if (!FLAGS_lcd_use_BoW)
+  LOG(FATAL) << "detectLoopById doesn't currently work with SALAD.";
+  
   const auto frame = cache_.getFrame(frame_id);
   if (!frame) {
     if (result) {
@@ -675,12 +742,14 @@ void LoopClosureDetector::detectLoopById(const FrameId& frame_id,
 
   DBoW2::BowVector curr_bow_vec;
   db_BoW_->getVocabulary()->transform(frame->descriptors_vec_, curr_bow_vec);
-  detectLoop(frame_id, curr_bow_vec, result);
+  at::Tensor SALAD_descriptors_mat;
+  detectLoop(frame_id, curr_bow_vec, SALAD_descriptors_mat, result);
 }
 
 /* ------------------------------------------------------------------------ */
 void LoopClosureDetector::detectLoop(const FrameId& frame_id,
                                      const DBoW2::BowVector& bow_vec,
+                                     const at::Tensor& SALAD_descriptors_mat,
                                      LoopResult* result) {
   CHECK_NOTNULL(result);
   result->query_id_ = frame_id;
@@ -692,13 +761,35 @@ void LoopClosureDetector::detectLoop(const FrameId& frame_id,
 
   // Query for BoW vector matches in database.
   DBoW2::QueryResults query_result;
-  db_BoW_->query(bow_vec,
-                 query_result,
-                 lcd_params_.max_db_results_,
-                 max_possible_match_id);
+  if (FLAGS_lcd_use_BoW)
+  {
+    db_BoW_->query(bow_vec,
+                  query_result,
+                  lcd_params_.max_db_results_,
+                  max_possible_match_id);
 
-  // Add current BoW vector to database.
-  db_BoW_->add(bow_vec);
+    // Add current BoW vector to database.
+    db_BoW_->add(bow_vec);
+  }
+  else
+  {
+    int k=std::min(lcd_params_.max_db_results_,(int)index.ntotal);
+    if (k>0)
+    {
+      std::vector<faiss::idx_t> indices(k);
+      std::vector<float> distances(k);
+
+      index.search(1,SALAD_descriptors_mat.data_ptr<float>(),k,distances.data(),indices.data());
+
+      for (int i=0;i<k;i++)
+      {
+        if (indices[i]<=max_possible_match_id)
+        query_result.push_back(DBoW2::Result(indices[i],distances[i]));
+      }
+    }
+
+    index.add(1,SALAD_descriptors_mat.data_ptr<float>());
+  }
 
   if (query_result.empty()) {
     result->status_ = LCDStatus::NO_MATCHES;
@@ -706,12 +797,16 @@ void LoopClosureDetector::detectLoop(const FrameId& frame_id,
   }
 
   double nss_factor = 1.0;
-  if (lcd_params_.use_nss_ && latest_bowvec_) {
+  if (FLAGS_lcd_use_BoW && lcd_params_.use_nss_ && latest_bowvec_!=nullptr) {
     nss_factor = db_BoW_->getVocabulary()->score(bow_vec, *latest_bowvec_);
+  } else if (!FLAGS_lcd_use_BoW && lcd_params_.use_nss_ && latest_SALAD_vec_!=nullptr) {
+    nss_factor = torch::dot(SALAD_descriptors_mat.squeeze(),(*latest_SALAD_vec_).squeeze()).item<float>();
   } else {
     LOG_IF(ERROR, !lcd_params_.use_nss_)
         << "Setting use_nss as false is deprecated.";
   }
+
+  LOG(INFO) << "nss factor: " << nss_factor;
 
   if (lcd_params_.use_nss_ && nss_factor < lcd_params_.min_nss_factor_) {
     result->status_ = LCDStatus::LOW_NSS_FACTOR;
